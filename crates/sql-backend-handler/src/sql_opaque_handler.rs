@@ -3,12 +3,12 @@ use async_trait::async_trait;
 use base64::Engine;
 use lldap_auth::opaque;
 use lldap_domain::types::UserId;
-use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
+use lldap_domain_handlers::handler::{BindRequest, LoginHandler, UserBackendHandler};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, UserColumn},
 };
-use lldap_opaque_handler::{OpaqueHandler, login, registration};
+use lldap_opaque_handler::{OpaqueHandler, ValidationResults, login, registration};
 use sea_orm::{ActiveModelTrait, ActiveValue, EntityTrait, QuerySelect};
 use secstr::SecUtf8;
 use tracing::{debug, info, instrument, warn};
@@ -187,13 +187,29 @@ impl OpaqueHandler for SqlOpaqueHandler {
     async fn registration_finish(
         &self,
         request: registration::ClientRegistrationFinishRequest,
+        validation_results: &ValidationResults,
     ) -> Result<()> {
         let secret_key = self.get_orion_secret_key()?;
         let registration::ServerData { username } = bincode::deserialize(&orion::aead::open(
             &secret_key,
             &base64::engine::general_purpose::STANDARD.decode(&request.server_data)?,
         )?)?;
-
+        // The finish must carry the same authorization as the start: valid
+        // credentials that are allowed to change the target user's password.
+        let user_is_admin = self
+            .get_user_groups(&username)
+            .await?
+            .iter()
+            .any(|g| g.display_name == "lldap_admin".into());
+        if !validation_results.can_change_password(&username, user_is_admin) {
+            warn!(
+                r#"User "{}" is not authorized to change the password of "{}""#,
+                &validation_results.user, &username
+            );
+            return Err(DomainError::AuthenticationError(
+                "Not authorized to change the user's password".to_string(),
+            ));
+        }
         let password_file =
             opaque::server::registration::get_password_file(request.registration_upload);
         // Set the user password to the new password.
@@ -215,6 +231,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
 #[instrument(skip_all, level = "debug", err, fields(username = %username.as_str()))]
 pub async fn register_password(
     opaque_handler: &SqlOpaqueHandler,
+    validation_results: &ValidationResults,
     username: UserId,
     password: &SecUtf8,
 ) -> Result<()> {
@@ -234,10 +251,13 @@ pub async fn register_password(
         &mut rng,
     )?;
     opaque_handler
-        .registration_finish(ClientRegistrationFinishRequest {
-            server_data: start_response.server_data,
-            registration_upload: registration_finish.message,
-        })
+        .registration_finish(
+            ClientRegistrationFinishRequest {
+                server_data: start_response.server_data,
+                registration_upload: registration_finish.message,
+            },
+            validation_results,
+        )
         .await
 }
 
@@ -249,6 +269,48 @@ mod tests {
     use crate::sql_backend_handler::tests::{
         get_initialized_db, insert_user, insert_user_no_password,
     };
+    use lldap_auth::access_control::Permission;
+
+    fn self_credentials(username: &str) -> ValidationResults {
+        ValidationResults {
+            user: UserId::new(username),
+            permission: Permission::Regular,
+        }
+    }
+
+    fn admin_credentials() -> ValidationResults {
+        ValidationResults {
+            user: UserId::new("admin"),
+            permission: Permission::Admin,
+        }
+    }
+
+    /// Performs the client side of the registration protocol for `username` and
+    /// returns the not-yet-submitted finish request.
+    async fn start_registration_transaction(
+        handler: &SqlBackendHandler,
+        username: &str,
+        password: &str,
+    ) -> Result<registration::ClientRegistrationFinishRequest> {
+        let mut rng = rand::rngs::OsRng;
+        let registration_start =
+            opaque::client::registration::start_registration(password.as_bytes(), &mut rng)?;
+        let start_response = handler
+            .registration_start(registration::ClientRegistrationStartRequest {
+                username: UserId::new(username),
+                registration_start_request: registration_start.message,
+            })
+            .await?;
+        let registration_finish = opaque::client::registration::finish_registration(
+            registration_start.state,
+            start_response.registration_response,
+            &mut rng,
+        )?;
+        Ok(registration::ClientRegistrationFinishRequest {
+            server_data: start_response.server_data,
+            registration_upload: registration_finish.message,
+        })
+    }
 
     async fn attempt_login(
         opaque_handler: &SqlOpaqueHandler,
@@ -289,6 +351,7 @@ mod tests {
             .unwrap_err();
         register_password(
             &backend_handler,
+            &admin_credentials(),
             UserId::new("bob"),
             &secstr::SecUtf8::from("bob00"),
         )
@@ -327,6 +390,44 @@ mod tests {
             })
             .await
             .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_registration_finish_requires_matching_credentials() -> Result<()> {
+        let sql_pool = get_initialized_db().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), sql_pool);
+        insert_user_no_password(&handler, "bob").await;
+
+        let finish_request = start_registration_transaction(&handler, "bob", "bob00").await?;
+        // A different regular user cannot finish a transaction for bob.
+        let err = handler
+            .registration_finish(finish_request.clone(), &self_credentials("john"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::AuthenticationError(_)));
+        // The right credentials still work: the failed attempt did not consume the
+        // transaction.
+        handler
+            .registration_finish(finish_request, &self_credentials("bob"))
+            .await
+            .unwrap();
+        attempt_login(&handler, "bob", "bob00").await.unwrap();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_registration_finish_admin_can_change_other_users() -> Result<()> {
+        let sql_pool = get_initialized_db().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), sql_pool);
+        insert_user_no_password(&handler, "bob").await;
+
+        let finish_request = start_registration_transaction(&handler, "bob", "bob00").await?;
+        handler
+            .registration_finish(finish_request, &admin_credentials())
+            .await
+            .unwrap();
+        attempt_login(&handler, "bob", "bob00").await.unwrap();
+        Ok(())
     }
 
     #[tokio::test]
