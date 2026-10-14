@@ -847,6 +847,38 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn test_register_finish_replay_rejected() {
+        let (handler, jwt_key, state) = setup_backend().await;
+        insert_user(&handler, "bob").await;
+        let finish_request = stage_password_change(&handler, "bob", "bob00").await;
+        let bob_jwt = mint_jwt(&handler, &jwt_key, "bob", false).await;
+
+        let app = actix_test::init_service(App::new().app_data(state.clone()).service(
+            web::scope("auth").configure(|cfg| configure_server::<SqlBackendHandler>(cfg, true)),
+        ))
+        .await;
+
+        let response = post_finish(&finish_request, Some(bob_jwt.clone()))
+            .send_request(&app)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Replaying the exact same finish request, even with valid credentials, must
+        // not succeed.
+        let response = post_finish(&finish_request, Some(bob_jwt))
+            .send_request(&app)
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // The password set by the first finish is the one that stays.
+        handler
+            .bind(BindRequest {
+                name: UserId::new("bob"),
+                password: "bob00".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
     async fn test_register_finish_cross_user_rejected() {
         let (handler, jwt_key, state) = setup_backend().await;
         insert_user(&handler, "bob").await;

@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
    as the start, so a finish request retained by anyone can no longer be replayed
    anonymously, by another user, or after logout (#1517)
 
+ - OPAQUE registration transactions now expire shortly after the start and are
+   consumed on first use, so a retained finish request can no longer be replayed
+   after a successful password change or survive an administrator reset;
+   registration_start also fails for nonexistent users instead of minting a
+   transaction for them (#1517)
+
 ## [0.6.3] 2026-05-01
 
 Small release, focused on LDAP compatibility, TLS maintenance, dependency upgrades and documentation/examples.
